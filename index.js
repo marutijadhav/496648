@@ -76,19 +76,15 @@
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
+const db = require('./dbconfig');
 
 const app = express();
 const PORT = 3000;
 
-// Middleware
 app.use(express.json());
 
-// In-memory storage
-const quizzes = {};
-const results = {};
-
 // Create Quiz
-app.post('/quizzes', (req, res) => {
+app.post('/quizzes', async (req, res) => {
     const { title, questions } = req.body;
 
     if (!title || !Array.isArray(questions) || questions.length === 0) {
@@ -96,80 +92,91 @@ app.post('/quizzes', (req, res) => {
     }
 
     const quizId = uuidv4();
-    quizzes[quizId] = {
-        id: quizId,
-        title,
-        questions: questions.map((q, index) => ({
-            id: `${quizId}-q${index + 1}`,
-            text: q.text,
-            options: q.options,
-            correct_option: q.correct_option
-        }))
-    };
 
-    res.status(201).json({ quizId });
+    try {
+        await db.query('INSERT INTO quizzes (id, title) VALUES (?, ?)', [quizId, title]);
+
+        for (const [index, q] of questions.entries()) {
+            const questionId = `${quizId}-q${index + 1}`;
+            await db.query(
+                'INSERT INTO questions (id, quiz_id, text, options, correct_option) VALUES (?, ?, ?, ?, ?)',
+                [questionId, quizId, q.text, JSON.stringify(q.options), q.correct_option]
+            );
+        }
+
+        res.status(201).json({ quizId });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
 });
 
 // Get Quiz
-app.get('/quizzes/:id', (req, res) => {
+app.get('/quizzes/:id', async (req, res) => {
     const { id } = req.params;
-    const quiz = quizzes[id];
 
-    if (!quiz) {
-        return res.status(404).json({ error: 'Quiz not found.' });
+    try {
+        const [quizRows] = await db.query('SELECT * FROM quizzes WHERE id = ?', [id]);
+        if (quizRows.length === 0) {
+            return res.status(404).json({ error: 'Quiz not found.' });
+        }
+
+        const [questionsRows] = await db.query('SELECT id, text, options FROM questions WHERE quiz_id = ?', [id]);
+
+        res.json({ id: quizRows[0].id, title: quizRows[0].title, questions: questionsRows });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error.' });
     }
-
-    const sanitizedQuiz = {
-        id: quiz.id,
-        title: quiz.title,
-        questions: quiz.questions.map(({ id, text, options }) => ({ id, text, options }))
-    };
-
-    res.json(sanitizedQuiz);
 });
 
 // Submit Answer
-app.post('/quizzes/:quizId/questions/:questionId/answers', (req, res) => {
+app.post('/quizzes/:quizId/questions/:questionId/answers', async (req, res) => {
     const { quizId, questionId } = req.params;
     const { selected_option } = req.body;
-
-    const quiz = quizzes[quizId];
-    if (!quiz) {
-        return res.status(404).json({ error: 'Quiz not found.' });
-    }
-
-    const question = quiz.questions.find(q => q.id === questionId);
-    if (!question) {
-        return res.status(404).json({ error: 'Question not found.' });
-    }
-
-    const isCorrect = question.correct_option === selected_option;
     const userId = req.headers['user-id'] || 'anonymous';
 
-    if (!results[quizId]) results[quizId] = {};
-    if (!results[quizId][userId]) results[quizId][userId] = { answers: [], score: 0 };
+    try {
+        const [questionRows] = await db.query('SELECT * FROM questions WHERE id = ?', [questionId]);
+        if (questionRows.length === 0) {
+            return res.status(404).json({ error: 'Question not found.' });
+        }
 
-    results[quizId][userId].answers.push({
-        question_id: questionId,
-        selected_option,
-        is_correct: isCorrect
-    });
+        const question = questionRows[0];
+        const isCorrect = question.correct_option === selected_option;
 
-    if (isCorrect) results[quizId][userId].score += 1;
+        await db.query(
+            'INSERT INTO results (quiz_id, user_id, question_id, selected_option, is_correct) VALUES (?, ?, ?, ?, ?)',
+            [quizId, userId, questionId, selected_option, isCorrect]
+        );
 
-    res.json({ is_correct: isCorrect, correct_option: question.correct_option });
+        res.json({ is_correct: isCorrect, correct_option: question.correct_option });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
 });
 
 // Get Results
-app.get('/quizzes/:quizId/results/:userId', (req, res) => {
+app.get('/quizzes/:quizId/results/:userId', async (req, res) => {
     const { quizId, userId } = req.params;
-    const quizResults = results[quizId]?.[userId];
 
-    if (!quizResults) {
-        return res.status(404).json({ error: 'Results not found.' });
+    try {
+        const [resultsRows] = await db.query(
+            'SELECT * FROM results WHERE quiz_id = ? AND user_id = ?',
+            [quizId, userId]
+        );
+
+        if (resultsRows.length === 0) {
+            return res.status(404).json({ error: 'Results not found.' });
+        }
+
+        const score = resultsRows.filter(r => r.is_correct).length;
+        res.json({ quiz_id: quizId, user_id: userId, score, answers: resultsRows });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error.' });
     }
-
-    res.json(quizResults);
 });
 
 // Start server
